@@ -1,7 +1,8 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
 
+from booking_models import BookingRequest
 from services import cinema
 
 app = FastAPI(title="Cinema Booking")
@@ -44,14 +45,9 @@ def list_bookings():
     return respond(cinema.list_bookings())
 
 
-@app.post("/api/bookings")
-async def create_bookings(request: Request):
-    try:
-        data = await request.json() if request.headers.get("content-type", "").split(";")[0].lower() == "application/json" else None
-    except ValueError:
-        data = None
-    return respond(await run_in_threadpool(cinema.create_bookings, data))
-
+@app.post("/api/bookings", status_code=201)
+async def create_bookings(booking: BookingRequest):
+    return respond(await run_in_threadpool(cinema.create_bookings, booking.model_dump()))
 
 @app.delete("/api/bookings/{booking_id}")
 def delete_booking(booking_id: str):

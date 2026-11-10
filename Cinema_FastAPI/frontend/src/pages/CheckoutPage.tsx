@@ -64,7 +64,10 @@ function CheckoutPage() {
       });
       if (!response.ok) {
         const data = await response.json().catch(() => null);
-        throw new Error(data?.error || 'Не удалось оформить билеты');
+        const message = response.status === 422
+          ? 'Проверь данные заказа: номера ряда и места должны быть целыми числами.'
+          : 'Не удалось оформить билеты';
+        throw new Error(data?.error || message);
       }
 
       completePurchase();
