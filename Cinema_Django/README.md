@@ -9,6 +9,7 @@ Extract the archive and open PowerShell in the folder containing package.json.
 cd backend
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe manage.py migrate
 .\.venv\Scripts\python.exe manage.py runserver 127.0.0.1:5000
 ```
 
@@ -25,5 +26,8 @@ Open the URL printed by Vite (usually http://localhost:5173/).
 Keep both terminals open. The API runs at http://127.0.0.1:5000/api/health.
 Run one version at a time on these ports.
 
-The included SQLite database contains movies and the November 2026 schedule.
-It starts with no customer bookings. No PocketBase setup is required.
+The application uses Django ORM models in backend/booking/models.py.
+The included cinema.db already contains the catalog and schedule.
+Migrations in booking/migrations describe the database schema.
+All API database operations use Django ORM and transaction.atomic().
+

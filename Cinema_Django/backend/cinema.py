@@ -1,30 +1,32 @@
 import json
-import sqlite3
-from contextlib import closing
-from pathlib import Path
-from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from uuid import uuid4
 
-DATABASE = Path(__file__).with_name("cinema.db")
+from django.db import IntegrityError, transaction
+from django.db.models import F
+from django.utils import timezone
+
+from booking.models import Movie, Session, Booking, BookedSeat
 
 
-def open_database():
-    connection = sqlite3.connect(DATABASE)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    return connection
+MOVIE_FIELDS = ("id", "title", "poster", "backdrop", "overview", "rating",
+                "genres", "ageRating", "duration", "releaseDate")
 
 
-SESSION_COLUMNS = ("id", "movieId", "hallId", "date", "time", "format", "price")
+def movie_payload(movie, detailed=False):
+    fields = MOVIE_FIELDS + (("director", "cast") if detailed else ())
+    return {field: getattr(movie, field) for field in fields}
 
 
-def movie_payload(row):
-    movie = dict(row)
-    movie["genres"] = json.loads(movie["genres"])
-    if "cast" in movie:
-        movie["cast"] = json.loads(movie["cast"])
-    return movie
+def session_payload(session):
+    return {"id": session.id, "movieId": session.movie_id, "hallId": session.hall_id,
+            "date": session.date, "time": session.time, "format": session.format,
+            "price": float(session.price)}
+
+
+def cinema_payload(cinema):
+    return {field: getattr(cinema, field) for field in
+            ("id", "name", "address", "phone", "metro", "workingHours")}
 
 
 def health():
@@ -32,122 +34,46 @@ def health():
 
 
 def get_movies():
-    with closing(open_database()) as connection:
-        rows = connection.execute("""
-            SELECT id, title, poster, backdrop, overview, rating,
-                   genres, ageRating, duration, releaseDate
-            FROM movies
-            ORDER BY created DESC, id
-        """).fetchall()
-    return [movie_payload(row) for row in rows]
+    movies = Movie.objects.order_by("-created", "id")
+    return [movie_payload(movie) for movie in movies]
 
 
 def get_movie(movie_id):
-    with closing(open_database()) as connection:
-        row = connection.execute("""
-            SELECT id, title, poster, backdrop, overview, rating,
-                   genres, ageRating, duration, releaseDate, director, "cast"
-            FROM movies
-            WHERE id = ?
-        """, (movie_id,)).fetchone()
-        if row is None:
-            return {"error": "Фильм не найден"}, 404
-
-        sessions = connection.execute("""
-            SELECT s.id, s.movieId, s.hallId, s.date, s.time, s.format, s.price,
-                   c.id AS cinema_id, c.name AS cinema_name,
-                   c.address, c.phone, c.metro, c.workingHours
-            FROM sessions AS s
-            JOIN halls AS h ON h.id = s.hallId
-            JOIN cinemas AS c ON c.id = h.cinemaId
-            WHERE s.movieId = ?
-            ORDER BY s.date, s.time, s.id
-        """, (movie_id,)).fetchall()
-
-    return {
-        "movie": movie_payload(row),
-        "sessions": [
-            {
-                **{field: session[field] for field in SESSION_COLUMNS},
-                "cinema": {
-                    "id": session["cinema_id"], "name": session["cinema_name"],
-                    "address": session["address"], "phone": session["phone"],
-                    "metro": session["metro"], "workingHours": session["workingHours"],
-                },
-            }
-            for session in sessions
-        ],
-    }
+    try:
+        movie = Movie.objects.get(pk=movie_id)
+    except Movie.DoesNotExist:
+        return {"error": "Фильм не найден"}, 404
+    sessions = Session.objects.filter(movie=movie).select_related("hall__cinema").order_by("date", "time", "id")
+    return {"movie": movie_payload(movie, detailed=True), "sessions": [
+        {**session_payload(session), "cinema": cinema_payload(session.hall.cinema)}
+        for session in sessions
+    ]}
 
 
 def get_booking_details(movie_id, session_id):
-    with closing(open_database()) as connection:
-        row = connection.execute("""
-            SELECT m.title, m.poster,
-                   s.id, s.movieId, s.hallId, s.date, s.time, s.format, s.price,
-                   h.name AS hall_name, h.rows, h.seatsPerRow, h.vipRows,
-                   c.id AS cinema_id, c.name AS cinema_name, c.address, c.metro
-            FROM sessions AS s
-            JOIN movies AS m ON m.id = s.movieId
-            JOIN halls AS h ON h.id = s.hallId
-            JOIN cinemas AS c ON c.id = h.cinemaId
-            WHERE s.id = ? AND s.movieId = ?
-        """, (session_id, movie_id)).fetchone()
-
-    if row is None:
+    try:
+        session = Session.objects.select_related("movie", "hall__cinema").get(
+            pk=session_id, movie_id=movie_id)
+    except Session.DoesNotExist:
         return {"error": "Сеанс этого фильма не найден"}, 404
-
+    hall = session.hall
+    cinema = hall.cinema
     return {
-        "movie": {"id": row["movieId"], "title": row["title"], "poster": row["poster"]},
-        "session": {field: row[field] for field in SESSION_COLUMNS},
-        "hall": {
-            "id": row["hallId"], "name": row["hall_name"], "cinemaId": row["cinema_id"],
-            "rows": row["rows"], "seatsPerRow": row["seatsPerRow"],
-            "vipRows": json.loads(row["vipRows"] or "[]"),
-        },
-        "cinema": {
-            "id": row["cinema_id"], "name": row["cinema_name"],
-            "address": row["address"], "metro": row["metro"],
-        },
+        "movie": {"id": session.movie_id, "title": session.movie.title, "poster": session.movie.poster},
+        "session": session_payload(session),
+        "hall": {"id": hall.id, "name": hall.name, "cinemaId": hall.cinema_id,
+                 "rows": hall.rows, "seatsPerRow": hall.seatsPerRow, "vipRows": hall.vipRows},
+        "cinema": {field: getattr(cinema, field) for field in ("id", "name", "address", "metro")},
     }
-
-
-def ensure_booking_tables(db):
-    db.execute("""
-        CREATE TABLE IF NOT EXISTS bookings (
-            id TEXT PRIMARY KEY NOT NULL,
-            session_id TEXT NOT NULL REFERENCES sessions(id),
-            customer_name TEXT NOT NULL,
-            customer_email TEXT NOT NULL,
-            customer_phone TEXT NOT NULL,
-            total_price REAL NOT NULL,
-            purchase_date TEXT NOT NULL,
-            UNIQUE (id, session_id)
-        )
-    """)
-    db.execute("""
-        CREATE TABLE IF NOT EXISTS booked_seats (
-            booking_id TEXT NOT NULL,
-            session_id TEXT NOT NULL,
-            row_number INTEGER NOT NULL,
-            seat_number INTEGER NOT NULL,
-            PRIMARY KEY (session_id, row_number, seat_number),
-            FOREIGN KEY (booking_id, session_id)
-                REFERENCES bookings(id, session_id) ON DELETE CASCADE
-        )
-    """)
 
 
 class SessionNotFound(Exception):
     pass
 
 
-def booking_session(db, session_id):
-    return db.execute("""
-        SELECT s.id, s.price, h.rows, h.seatsPerRow, h.vipRows
-        FROM sessions s JOIN halls h ON h.id = s.hallId
-        WHERE s.id = ?
-    """, (session_id,)).fetchone()
+def get_occupied_seats(session_id):
+    return list(BookedSeat.objects.filter(session_id=session_id).values(
+        row=F("row_number"), seat=F("seat_number")))
 
 
 def seat_positions(seats, session):
@@ -159,30 +85,13 @@ def seat_positions(seats, session):
             raise ValueError("Некорректное место")
         row, number = seat.get("row"), seat.get("seat")
         if (type(row) is not int or type(number) is not int
-                or not 1 <= row <= (session["rows"] or 8)
-                or not 1 <= number <= (session["seatsPerRow"] or 12)):
+                or not 1 <= row <= (session.hall.rows or 8)
+                or not 1 <= number <= (session.hall.seatsPerRow or 12)):
             raise ValueError("Место находится за пределами зала")
         positions.append((row, number))
     if len(set(positions)) != len(positions):
         raise ValueError("Одно место выбрано дважды")
     return positions
-
-
-def insert_booking(db, booking_id, session_id, name, email, phone, total, purchased, positions):
-    db.execute("INSERT INTO bookings VALUES (?, ?, ?, ?, ?, ?, ?)",
-               (booking_id, session_id, name, email, phone, total, purchased))
-    db.executemany("INSERT INTO booked_seats VALUES (?, ?, ?, ?)",
-                   [(booking_id, session_id, row, seat) for row, seat in positions])
-
-
-def get_occupied_seats(session_id):
-    with closing(open_database()) as db:
-        ensure_booking_tables(db)
-        rows = db.execute("""
-            SELECT row_number AS row, seat_number AS seat
-            FROM booked_seats WHERE session_id = ?
-        """, (session_id,)).fetchall()
-    return [dict(row) for row in rows]
 
 
 def create_bookings(data):
@@ -203,68 +112,60 @@ def create_bookings(data):
     if not isinstance(promo, str) or promo not in discounts:
         return {"error": "Промокод недействителен"}, 400
 
-    purchased = datetime.now(timezone.utc).isoformat()
+    purchased = timezone.now()
     ids = []
     try:
-        with closing(open_database()) as db, db:
-            db.execute("BEGIN IMMEDIATE")
-            ensure_booking_tables(db)
+        with transaction.atomic():
             for item in items:
                 if not isinstance(item, dict) or not isinstance(item.get("sessionId"), str):
                     raise ValueError("Некорректный сеанс")
-                session = booking_session(db, item["sessionId"])
+                session = Session.objects.select_related("hall").filter(pk=item["sessionId"]).first()
                 if session is None:
                     raise SessionNotFound
                 positions = seat_positions(item.get("seats"), session)
-                vip_rows = set(json.loads(session["vipRows"] or "[]"))
-                total = Decimal(str(session["price"])) * len(positions)
+                vip_rows = set(session.hall.vipRows or [])
+                total = session.price * len(positions)
                 total += 200 * sum(row in vip_rows for row, _ in positions)
                 total *= Decimal(100 - discounts[promo]) / 100
                 total = total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
                 booking_id = uuid4().hex
-                insert_booking(db, booking_id, session["id"], name.strip(), email.strip(),
-                               data.get("customerPhone") or "", float(total), purchased, positions)
+                booking = Booking.objects.create(
+                    id=booking_id, session=session, customer_name=name.strip(),
+                    customer_email=email.strip(), customer_phone=data.get("customerPhone") or "",
+                    total_price=total, purchase_date=purchased,
+                )
+                BookedSeat.objects.bulk_create([
+                    BookedSeat(booking=booking, session=session, row_number=row, seat_number=seat)
+                    for row, seat in positions
+                ])
                 ids.append(booking_id)
     except SessionNotFound:
         return {"error": "Сеанс не найден"}, 404
     except ValueError as error:
         return {"error": str(error)}, 400
-    except sqlite3.IntegrityError as error:
-        if "booked_seats.session_id" not in str(error):
+    except IntegrityError as error:
+        if "booking_bookedseat.session_id" not in str(error):
             raise
         return {"error": "Одно из выбранных мест уже занято"}, 409
     return {"ids": ids}, 201
 
 
 def list_bookings():
-    with closing(open_database()) as db:
-        ensure_booking_tables(db)
-        rows = db.execute("""
-            SELECT b.id, m.title AS movieTitle, s.date AS sessionDate,
-                   s.time AS sessionTime, s.format AS sessionFormat,
-                   h.name AS hallName, b.total_price AS totalPrice,
-                   b.customer_name AS customerName, b.customer_email AS customerEmail,
-                   b.purchase_date AS purchaseDate
-            FROM bookings b JOIN sessions s ON s.id = b.session_id
-            JOIN halls h ON h.id = s.hallId JOIN movies m ON m.id = s.movieId
-            ORDER BY b.purchase_date DESC, b.id
-        """).fetchall()
-        result = []
-        for row in rows:
-            booking = dict(row)
-            seats = db.execute("""
-                SELECT row_number AS row, seat_number AS seat FROM booked_seats
-                WHERE booking_id = ? ORDER BY row_number, seat_number
-            """, (row["id"],)).fetchall()
-            booking["seats"] = json.dumps([dict(seat) for seat in seats])
-            result.append(booking)
-    return result
+    bookings = Booking.objects.select_related("session__movie", "session__hall").prefetch_related("seats").order_by("-purchase_date", "id")
+    return [{
+        "id": booking.id, "movieTitle": booking.session.movie.title,
+        "sessionDate": booking.session.date, "sessionTime": booking.session.time,
+        "sessionFormat": booking.session.format, "hallName": booking.session.hall.name,
+        "totalPrice": float(booking.total_price), "customerName": booking.customer_name,
+        "customerEmail": booking.customer_email, "purchaseDate": booking.purchase_date.isoformat(),
+        # Keep the existing frontend contract: seats is a JSON string.
+        "seats": json.dumps([{"row": s.row_number, "seat": s.seat_number} for s in booking.seats.all()]),
+    } for booking in bookings]
 
 
 def delete_booking(booking_id):
-    with closing(open_database()) as db, db:
-        ensure_booking_tables(db)
-        deleted = db.execute("DELETE FROM bookings WHERE id = ?", (booking_id,))
-        if not deleted.rowcount:
+    with transaction.atomic():
+        deleted, _ = Booking.objects.filter(pk=booking_id).delete()
+        if not deleted:
             return {"error": "Билет не найден"}, 404
     return "", 204

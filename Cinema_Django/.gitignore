@@ -27,3 +27,6 @@ dist-ssr
 .venv/
 __pycache__/
 *.tsbuildinfo
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
